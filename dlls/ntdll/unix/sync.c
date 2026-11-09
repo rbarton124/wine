@@ -4945,6 +4945,7 @@ static struct
     const void *addr;   /* wait-on-address cookie; NULL = not currently parked */
     ULONGLONG since;    /* NtQuerySystemTime at park entry */
     int inf;            /* 1 = INFINITE wait */
+    const void *slice;  /* woa-recheck: the address whose slice just timed out (the park goes on) */
 } ios_alert_waiters[IOS_ALERT_WAITER_MAX];
 
 static int ios_alert_waiter_slot( void *tid )
@@ -5319,6 +5320,18 @@ static LONGLONG update_timeout( ULONGLONG end )
 /***********************************************************************
  *             NtWaitForAlertByThreadId (NTDLL.@)
  */
+/* Madeira woa-recheck: the 32-bit ntdll's RtlWaitOnAddress waits an infinite
+ * wait out in slices of exactly MADEIRA_WOA_SLICE, re-checking its queue entry after each. With
+ * env.MADEIRA_WOA_RECHECK = 1 the slices of one park keep its [waiters] start time and count as infinite; otherwise a
+ * slice is waited out as the infinite wait it stands for (the old behaviour). Read at each slice. */
+#define MADEIRA_WOA_SLICE (-10000001)
+static int madeira_woa_recheck(void)
+{
+    const char *e = getenv( "MADEIRA_WOA_RECHECK" );
+
+    return e && e[0] == '1' && !e[1];
+}
+
 NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEGER *timeout )
 {
     IOS_ECO_POLL();   /* ml1133 */
@@ -5358,7 +5371,13 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         ULONGLONG end;
         int ret;
         int ios_wslot;
+        int ios_woa_slice = timeout && timeout->QuadPart == MADEIRA_WOA_SLICE;   /* woa-recheck */
 
+        if (ios_woa_slice && !madeira_woa_recheck())
+        {
+            timeout = NULL;   /* woa-recheck not on: the infinite wait the slice stands for */
+            ios_woa_slice = 0;
+        }
         if (timeout)
         {
             if (timeout->QuadPart == TIMEOUT_INFINITE)
@@ -5375,8 +5394,11 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
         {
             LARGE_INTEGER ios_wnow;
             NtQuerySystemTime( &ios_wnow );
-            ios_alert_waiters[ios_wslot].since = ios_wnow.QuadPart;
-            ios_alert_waiters[ios_wslot].inf = !timeout;
+            /* woa-recheck: the next slice of the same park keeps its start and counts as infinite */
+            if (!ios_woa_slice || ios_alert_waiters[ios_wslot].slice != (address ? address : (const void *)0x1))
+                ios_alert_waiters[ios_wslot].since = ios_wnow.QuadPart;
+            ios_alert_waiters[ios_wslot].inf = !timeout || ios_woa_slice;
+            ios_alert_waiters[ios_wslot].slice = NULL;
             ios_alert_waiters[ios_wslot].addr = address ? address : (const void *)0x1;
         }
 
@@ -5424,7 +5446,12 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
             if (ret == -1 && errno == ETIMEDOUT)
             {
-                if (ios_wslot >= 0) ios_alert_waiters[ios_wslot].addr = NULL;
+                if (ios_wslot >= 0)
+                {
+                    /* woa-recheck: a slice that timed out leaves its park open for the next slice */
+                    ios_alert_waiters[ios_wslot].slice = ios_woa_slice ? ios_alert_waiters[ios_wslot].addr : NULL;
+                    ios_alert_waiters[ios_wslot].addr = NULL;
+                }
                 if (ios_marked && ios_alert_unix_n < 120) { InterlockedIncrement( &ios_alert_unix_n );
                     ERR( "[alert-unix] tid=%04x -> TIMEOUT\n",
                          (int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread ); }
