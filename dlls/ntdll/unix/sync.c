@@ -3625,6 +3625,19 @@ NTSTATUS WINAPI NtYieldExecution(void)
 /******************************************************************
  *		NtDelayExecution (NTDLL.@)
  */
+#ifdef WINE_IOS
+/* Madeira sleep-kernel-apc: with env.MADEIRA_SLEEP_KERNEL_APC = 1 a
+ * non-alertable sleep waits in the server with SELECT_INTERRUPTIBLE, so a system APC (an I/O completion) queued for
+ * the sleeping thread runs during the sleep, as on Windows; on iOS nothing can interrupt the host select(). Read at
+ * each sleep, so the value is the session's own. */
+static int madeira_sleep_kernel_apc(void)
+{
+    const char *e = getenv( "MADEIRA_SLEEP_KERNEL_APC" );
+
+    return e && e[0] == '1' && !e[1];
+}
+#endif
+
 NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     unsigned int status = STATUS_SUCCESS;
@@ -3650,6 +3663,10 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
+#ifdef WINE_IOS
+        if (madeira_sleep_kernel_apc())   /* sleep-kernel-apc */
+            for (;;) server_wait( NULL, 0, SELECT_INTERRUPTIBLE, NULL );
+#endif
         for (;;) select( 0, NULL, NULL, NULL, NULL );
     }
     else
@@ -3667,6 +3684,13 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
            we only care about the result of the yield for zero timeouts */
         status = NtYieldExecution();
         if (!when) return status;
+#ifdef WINE_IOS
+        if (madeira_sleep_kernel_apc())   /* sleep-kernel-apc: system APCs run during the sleep */
+        {
+            server_wait( NULL, 0, SELECT_INTERRUPTIBLE, timeout );
+            return STATUS_SUCCESS;
+        }
+#endif
 
         for (;;)
         {
